@@ -157,6 +157,7 @@ func (s *Search) BuildMethodCompletions(
 	parentTypeFQN string,
 	filterMembers bool,
 	symbolToSearch sourcecode.Word,
+	suggestedMethods *[]string,
 ) []protocol.CompletionItem {
 	var items []protocol.CompletionItem
 
@@ -175,21 +176,69 @@ func (s *Search) BuildMethodCompletions(
 		uint32(symbolToSearch.PrevAccessPath().TextRange().Start.Line),
 		uint32(symbolToSearch.PrevAccessPath().TextRange().End.Character+2),
 	)
+
 	methods = state.SearchByFQN(query)
+	newlySuggestedMethods := []string{}
 	for _, idx := range methods {
 		fn, _ := idx.(*symbols.Function)
 		kind := idx.GetKind()
+
+		// By default, finish the completion of 'abc.methodNa'
+		// with 'abc.methodName()'.
+		methodName := fn.GetMethodName()
+		var textEdit any = protocol.TextEdit{
+			NewText: methodName,
+			Range:   replacementRange,
+		}
+		var additionalTextEdits []protocol.TextEdit = nil
+		if slices.Contains(*suggestedMethods, methodName) {
+			// Method name was already suggested, so propose an edit to the non-shorthand
+			// method form instead.
+			// That is, replace 'abc.methodNa' with 'Type.methodName(abc)'.
+			// (TODO: Auto-import the type if needed, or use FQN, or something else.)
+			accessPath := ""
+			for _, segment := range symbolToSearch.AccessPath() {
+				accessPath += segment.Text()
+			}
+
+			startRange := protocol_utils.NewLSPRange(
+				uint32(symbolToSearch.FullTextRange().Start.Line),
+				uint32(symbolToSearch.FullTextRange().Start.Character),
+				uint32(symbolToSearch.FullTextRange().Start.Line),
+				uint32(symbolToSearch.FullTextRange().Start.Character),
+			)
+			endRange := protocol_utils.NewLSPRange(
+				uint32(symbolToSearch.PrevAccessPath().TextRange().Start.Line),
+				uint32(symbolToSearch.PrevAccessPath().TextRange().End.Character),
+				uint32(symbolToSearch.PrevAccessPath().TextRange().Start.Line),
+				uint32(symbolToSearch.PrevAccessPath().TextRange().End.Character+1),
+			)
+
+			textEdit = protocol.TextEdit{
+				NewText: ")",
+				Range:   endRange,
+			}
+			additionalTextEdits = []protocol.TextEdit{
+				{
+					NewText: fn.GetName() + "(",
+					Range:   startRange,
+				},
+			}
+		} else {
+			newlySuggestedMethods = append(newlySuggestedMethods, methodName)
+		}
+
 		items = append(items, protocol.CompletionItem{
-			Label: fn.GetName(),
-			Kind:  &kind,
-			TextEdit: protocol.TextEdit{
-				NewText: fn.GetMethodName(),
-				Range:   replacementRange,
-			},
-			Documentation: GetCompletableDocComment(fn),
-			Detail:        GetCompletionDetail(fn),
+			Label:               fn.GetName(),
+			Kind:                &kind,
+			TextEdit:            textEdit,
+			AdditionalTextEdits: additionalTextEdits,
+			Documentation:       GetCompletableDocComment(fn),
+			Detail:              GetCompletionDetail(fn),
 		})
 	}
+
+	*suggestedMethods = append(*suggestedMethods, newlySuggestedMethods...)
 
 	return items
 }
@@ -272,7 +321,7 @@ func (s *Search) BuildCompletionList(
 
 		//	searchParams.scopeMode = AnyPosition
 
-		membersReadable, fromDistinct, initialItems, prevIndexableOption := s.findParentTypeWithCompletions(
+		membersReadable, fromDistinct, suggestedMethods, initialItems, prevIndexableOption := s.findParentTypeWithCompletions(
 			filterMembers,
 			symbolInPosition,
 			searchParams,
@@ -322,7 +371,7 @@ func (s *Search) BuildCompletionList(
 			// If this struct was the base type of a non-inline distinct variable,
 			// do not suggest its methods, as they cannot be accessed
 			if methodsReadable {
-				items = append(items, s.BuildMethodCompletions(state, strukt.GetFQN(), filterMembers, symbolInPosition)...)
+				items = append(items, s.BuildMethodCompletions(state, strukt.GetFQN(), filterMembers, symbolInPosition, &suggestedMethods)...)
 			}
 
 		case *symbols.Enumerator:
@@ -345,7 +394,7 @@ func (s *Search) BuildCompletionList(
 
 			// Add parent enum's methods, but only if this doesn't come from a non-inline distinct.
 			if methodsReadable && enumerator.GetModuleString() != "" && enumerator.GetEnumName() != "" {
-				items = append(items, s.BuildMethodCompletions(state, enumerator.GetEnumFQN(), filterMembers, symbolInPosition)...)
+				items = append(items, s.BuildMethodCompletions(state, enumerator.GetEnumFQN(), filterMembers, symbolInPosition, &suggestedMethods)...)
 			}
 
 		case *symbols.FaultConstant:
@@ -353,7 +402,7 @@ func (s *Search) BuildCompletionList(
 
 			// Add parent fault's methods
 			if methodsReadable && constant.GetModuleString() != "" && constant.GetFaultName() != "" {
-				items = append(items, s.BuildMethodCompletions(state, constant.GetFaultFQN(), filterMembers, symbolInPosition)...)
+				items = append(items, s.BuildMethodCompletions(state, constant.GetFaultFQN(), filterMembers, symbolInPosition, &suggestedMethods)...)
 			}
 
 		case *symbols.Enum:
@@ -396,7 +445,7 @@ func (s *Search) BuildCompletionList(
 			}
 
 			if methodsReadable {
-				items = append(items, s.BuildMethodCompletions(state, enum.GetFQN(), filterMembers, symbolInPosition)...)
+				items = append(items, s.BuildMethodCompletions(state, enum.GetFQN(), filterMembers, symbolInPosition, &suggestedMethods)...)
 			}
 
 		case *symbols.Fault:
@@ -422,7 +471,7 @@ func (s *Search) BuildCompletionList(
 			}
 
 			if methodsReadable {
-				items = append(items, s.BuildMethodCompletions(state, fault.GetFQN(), filterMembers, symbolInPosition)...)
+				items = append(items, s.BuildMethodCompletions(state, fault.GetFQN(), filterMembers, symbolInPosition, &suggestedMethods)...)
 			}
 		}
 	} else {
@@ -478,25 +527,36 @@ func (s *Search) BuildCompletionList(
 	return items
 }
 
-// Returns whether members can be read from the found symbol, the 'fromDistinct' status, the list of
-// completions found while resolving distincts in a distinct chain (if any), as well as the final symbol
-// found for further completions.
+// Returns whether members can be read from the found symbol, the 'fromDistinct' status,
+// the list of suggested method names so far,
+// the list of completions found while resolving distincts in a distinct chain
+// (if any), as well as the final symbol found for further completions.
 func (s *Search) findParentTypeWithCompletions(
 	filterMembers bool,
 	symbolInPosition sourcecode.Word,
 	searchParams sp.SearchParams,
 	state *l.ProjectState,
 	debugger FindDebugger,
-) (bool, int, []protocol.CompletionItem, option.Option[symbols.Indexable]) {
+) (bool, int, []string, []protocol.CompletionItem, option.Option[symbols.Indexable]) {
 	prevIndexableResult := s.findInParentSymbols(searchParams, state, debugger)
 	membersReadable := prevIndexableResult.membersReadable
 	fromDistinct := prevIndexableResult.fromDistinct
 	items := []protocol.CompletionItem{}
 	if prevIndexableResult.IsNone() {
-		return membersReadable, fromDistinct, items, prevIndexableResult.result
+		return membersReadable, fromDistinct, []string{}, items, prevIndexableResult.result
 	}
 	symbolsHierarchy := []symbols.Indexable{}
 	prevIndexable := prevIndexableResult.Get()
+
+	// List of all suggested methods.
+	// Sometimes, methods with the same name but different types are suggested,
+	// e.g. if a distinct type has its own method "Distinct.abc(self)" and it points
+	// to a type "Struct" which has a method "Struct.abc(self, int x)". In that case,
+	// we may suggest both, but the method shorthand (i.e. writing 'distinct.abc()')
+	// will only work for the first method in the distinct chain. For the other ones,
+	// on completion, we should suggest the full form (Struct.abc(distinct, x))
+	// instead.
+	suggestedMethods := []string{}
 
 	// Can only read methods if the current type being inspected wasn't the base type of a distinct,
 	// or if it was, then we're currently inspecting an inline distinct INSTANCE and not the type itself, since
@@ -511,7 +571,7 @@ func (s *Search) findParentTypeWithCompletions(
 	protect := 0
 	for {
 		if protect > 1000 {
-			return true, NotFromDistinct, items, option.None[symbols.Indexable]()
+			return true, NotFromDistinct, []string{}, items, option.None[symbols.Indexable]()
 		}
 		protect++
 
@@ -524,7 +584,7 @@ func (s *Search) findParentTypeWithCompletions(
 			// base type, an instance of it, or an instance of an inline distinct
 			// pointing to it.
 			if methodsReadable {
-				items = append(items, s.BuildMethodCompletions(state, distinct.GetFQN(), filterMembers, symbolInPosition)...)
+				items = append(items, s.BuildMethodCompletions(state, distinct.GetFQN(), filterMembers, symbolInPosition, &suggestedMethods)...)
 			}
 
 			if distinct.IsInline() {
@@ -543,7 +603,7 @@ func (s *Search) findParentTypeWithCompletions(
 			if prevIndexable == nil {
 				// No point in trying to complete methods / members when the resolved type is not
 				// inspectable and doesn't resolve to anything that is inspectable
-				return true, NotFromDistinct, items, option.None[symbols.Indexable]()
+				return true, NotFromDistinct, []string{}, items, option.None[symbols.Indexable]()
 			}
 
 			// Important for generic type resolution above
@@ -577,5 +637,5 @@ func (s *Search) findParentTypeWithCompletions(
 		resolvedIndexable = option.Some(prevIndexable)
 	}
 
-	return membersReadable, fromDistinct, items, resolvedIndexable
+	return membersReadable, fromDistinct, suggestedMethods, items, resolvedIndexable
 }

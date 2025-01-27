@@ -1,6 +1,9 @@
 package document
 
 import (
+	"fmt"
+	"os"
+
 	"github.com/pherrymason/c3-lsp/internal/lsp/cst"
 	code "github.com/pherrymason/c3-lsp/pkg/document/sourcecode"
 	"github.com/pherrymason/c3-lsp/pkg/symbols"
@@ -43,9 +46,11 @@ func (d *Document) ApplyChanges(changes []interface{}) {
 	for _, change := range changes {
 		switch c := change.(type) {
 		case protocol.TextDocumentContentChangeEvent:
+			fmt.Fprintf(os.Stderr, "The change was {Range: %+v, Text: %s}\n", *c.Range, c.Text)
 			startIndex, endIndex := c.Range.IndexesIn(d.SourceCode.Text)
 			d.SourceCode.Text = d.SourceCode.Text[:startIndex] + c.Text + d.SourceCode.Text[endIndex:]
 		case protocol.TextDocumentContentChangeEventWhole:
+			fmt.Fprintln(os.Stderr, "Everything changed!!!")
 			d.SourceCode.Text = c.Text
 		}
 	}
